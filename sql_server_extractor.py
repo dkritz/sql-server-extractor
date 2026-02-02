@@ -5,16 +5,18 @@ Extracts table DDLs, view definitions, and stored procedures from SQL Server
 and organizes them in a folder structure: server/database/object_type/
 """
 
-import pyodbc
-import os
 import json
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Generator, Union, Literal
+import warnings
+
+import pyodbc
 
 
 class ObjectType(Enum):
@@ -121,7 +123,16 @@ class SQLServerExtractor:
         return self._connection
     
     def connect(self) -> bool:
-        """Establish connection to SQL Server (legacy method)"""
+        """Establish connection to SQL Server (legacy method)
+        
+        .. deprecated:: 1.1.0
+            Use get_connection() context manager instead for better resource management.
+        """
+        warnings.warn(
+            "connect() is deprecated. Use get_connection() context manager instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         try:
             self._connection = pyodbc.connect(self.connection_string, timeout=30)
             self.logger.info("Successfully connected to SQL Server")
