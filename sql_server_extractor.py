@@ -5,13 +5,64 @@ Extracts table DDLs, view definitions, and stored procedures from SQL Server
 and organizes them in a folder structure: server/database/object_type/
 """
 
-import pyodbc
-import os
 import json
 import logging
+import os
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Generator, Union, Literal
+import warnings
+
+import pyodbc
+
+
+class ObjectType(Enum):
+    TABLE = "tables"
+    VIEW = "views"
+    PROCEDURE = "stored_procedures"
+
+
+@dataclass
+class DatabaseObject:
+    schema: str
+    name: str
+    
+    @property
+    def full_name(self) -> str:
+        return f"{self.schema}.{self.name}"
+
+
+@dataclass
+class TableInfo(DatabaseObject):
+    pass
+
+
+@dataclass
+class ViewInfo(DatabaseObject):
+    pass
+
+
+@dataclass
+class ProcedureInfo(DatabaseObject):
+    pass
+
+
+class SQLExtractorError(Exception):
+    """Base exception for SQL extractor operations"""
+    pass
+
+
+class ConnectionError(SQLExtractorError):
+    """Exception raised when database connection fails"""
+    pass
+
+
+class DDLExtractionError(SQLExtractorError):
+    """Exception raised when DDL extraction fails"""
+    pass
 
 
 class SQLServerExtractor:
@@ -24,7 +75,7 @@ class SQLServerExtractor:
         self.port = port
         self.trust_cert = trust_cert
         self.output_dir = Path(output_dir)
-        self.connection = None
+        self._connection: Optional[pyodbc.Connection] = None
         
         # Setup logging
         logging.basicConfig(
@@ -37,32 +88,63 @@ class SQLServerExtractor:
         )
         self.logger = logging.getLogger(__name__)
     
-    def connect(self) -> bool:
-        """Establish connection to SQL Server"""
+    @property
+    def connection_string(self) -> str:
+        """Generate database connection string"""
+        conn_str = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={self.server},{self.port};"
+            f"UID={self.username};"
+            f"PWD={self.password};"
+        )
+        if self.trust_cert:
+            conn_str += "TrustServerCertificate=yes;"
+        return conn_str
+    
+    @contextmanager
+    def get_connection(self) -> Generator[pyodbc.Connection, None, None]:
+        """Context manager for database connections"""
         try:
-            connection_string = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                f"SERVER={self.server},{self.port};"
-                f"UID={self.username};"
-                f"PWD={self.password};"
-            )
-            
-            if self.trust_cert:
-                connection_string += "TrustServerCertificate=yes;"
-            
             self.logger.info(f"Connecting to SQL Server: {self.server}")
-            self.connection = pyodbc.connect(connection_string, timeout=30)
+            self._connection = pyodbc.connect(self.connection_string, timeout=30)
+            self.logger.info("Successfully connected to SQL Server")
+            yield self._connection
+        except pyodbc.Error as e:
+            self.logger.error(f"Failed to connect to SQL Server: {e}")
+            raise ConnectionError(f"Database connection failed: {e}") from e
+        finally:
+            if self._connection:
+                self._connection.close()
+                self._connection = None
+    
+    @property
+    def connection(self) -> Optional[pyodbc.Connection]:
+        """Get current database connection"""
+        return self._connection
+    
+    def connect(self) -> bool:
+        """Establish connection to SQL Server (legacy method)
+        
+        .. deprecated:: 1.1.0
+            Use get_connection() context manager instead for better resource management.
+        """
+        warnings.warn(
+            "connect() is deprecated. Use get_connection() context manager instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        try:
+            self._connection = pyodbc.connect(self.connection_string, timeout=30)
             self.logger.info("Successfully connected to SQL Server")
             return True
-            
-        except Exception as e:
+        except pyodbc.Error as e:
             self.logger.error(f"Failed to connect to SQL Server: {e}")
             return False
     
     def get_databases(self) -> List[str]:
         """Get list of databases excluding system databases"""
         if not self.connection:
-            raise Exception("Not connected to database")
+            raise ConnectionError("Not connected to database")
         
         query = """
         SELECT name FROM sys.databases 
@@ -77,7 +159,7 @@ class SQLServerExtractor:
         self.logger.info(f"Found {len(databases)} user databases")
         return databases
     
-    def get_tables(self, database: str) -> List[Dict[str, Any]]:
+    def get_tables(self, database: str) -> List[TableInfo]:
         """Get list of user tables in a database"""
         query = f"""
         SELECT TABLE_SCHEMA, TABLE_NAME
@@ -88,11 +170,11 @@ class SQLServerExtractor:
         
         cursor = self.connection.cursor()
         cursor.execute(query)
-        tables = [{"schema": row[0], "name": row[1]} for row in cursor.fetchall()]
+        tables = [TableInfo(schema=row[0], name=row[1]) for row in cursor.fetchall()]
         self.logger.info(f"Found {len(tables)} tables in {database}")
         return tables
     
-    def get_views(self, database: str) -> List[Dict[str, Any]]:
+    def get_views(self, database: str) -> List[ViewInfo]:
         """Get list of views in a database"""
         query = f"""
         SELECT TABLE_SCHEMA, TABLE_NAME
@@ -102,11 +184,11 @@ class SQLServerExtractor:
         
         cursor = self.connection.cursor()
         cursor.execute(query)
-        views = [{"schema": row[0], "name": row[1]} for row in cursor.fetchall()]
+        views = [ViewInfo(schema=row[0], name=row[1]) for row in cursor.fetchall()]
         self.logger.info(f"Found {len(views)} views in {database}")
         return views
     
-    def get_stored_procedures(self, database: str) -> List[Dict[str, Any]]:
+    def get_stored_procedures(self, database: str) -> List[ProcedureInfo]:
         """Get list of stored procedures in a database"""
         query = f"""
         SELECT SPECIFIC_SCHEMA, SPECIFIC_NAME
@@ -117,7 +199,7 @@ class SQLServerExtractor:
         
         cursor = self.connection.cursor()
         cursor.execute(query)
-        procedures = [{"schema": row[0], "name": row[1]} for row in cursor.fetchall()]
+        procedures = [ProcedureInfo(schema=row[0], name=row[1]) for row in cursor.fetchall()]
         self.logger.info(f"Found {len(procedures)} stored procedures in {database}")
         return procedures
     
@@ -242,15 +324,14 @@ class SQLServerExtractor:
             
         return f"-- Could not extract stored procedure definition for {schema}.{procedure}"
     
-    def create_folder_structure(self, server_name: str) -> Dict[str, Path]:
+    def create_folder_structure(self, server_name: str) -> Dict[ObjectType, Path]:
         """Create folder structure for server"""
         server_folder = self.output_dir / server_name.replace("\\", "_").replace("/", "_")
         server_folder.mkdir(parents=True, exist_ok=True)
         
         folders = {
-            "tables": server_folder / "tables",
-            "views": server_folder / "views", 
-            "procedures": server_folder / "stored_procedures"
+            obj_type: server_folder / obj_type.value
+            for obj_type in ObjectType
         }
         
         for folder in folders.values():
@@ -293,23 +374,20 @@ class SQLServerExtractor:
                 # Extract tables
                 tables = self.get_tables(database)
                 for table in tables:
-                    full_name = f"{table['schema']}.{table['name']}"
-                    ddl = self.get_table_ddl(database, table['schema'], table['name'])
-                    self.save_object(folders['tables'], database, full_name, ddl)
+                    ddl = self.get_table_ddl(database, table.schema, table.name)
+                    self.save_object(folders[ObjectType.TABLE], database, table.full_name, ddl)
                 
                 # Extract views
                 views = self.get_views(database)
                 for view in views:
-                    full_name = f"{view['schema']}.{view['name']}"
-                    definition = self.get_view_definition(database, view['schema'], view['name'])
-                    self.save_object(folders['views'], database, full_name, definition)
+                    definition = self.get_view_definition(database, view.schema, view.name)
+                    self.save_object(folders[ObjectType.VIEW], database, view.full_name, definition)
                 
                 # Extract stored procedures
                 procedures = self.get_stored_procedures(database)
                 for procedure in procedures:
-                    full_name = f"{procedure['schema']}.{procedure['name']}"
-                    definition = self.get_stored_procedure_definition(database, procedure['schema'], procedure['name'])
-                    self.save_object(folders['procedures'], database, full_name, definition)
+                    definition = self.get_stored_procedure_definition(database, procedure.schema, procedure.name)
+                    self.save_object(folders[ObjectType.PROCEDURE], database, procedure.full_name, definition)
                 
                 self.logger.info(f"Completed extraction for database: {database}")
             
@@ -337,8 +415,8 @@ class SQLServerExtractor:
             if server_folder.exists():
                 databases = {}
                 
-                for obj_type in ["tables", "views", "stored_procedures"]:
-                    type_folder = server_folder / obj_type
+                for obj_type in ObjectType:
+                    type_folder = server_folder / obj_type.value
                     if type_folder.exists():
                         for db_folder in type_folder.iterdir():
                             if db_folder.is_dir():
@@ -352,7 +430,7 @@ class SQLServerExtractor:
                 
             report_file = self.output_dir / "extraction_report.json"
             with open(report_file, 'w') as f:
-                json.dump(report, f, indent=2)
+                json.dump(report, f, indent=2, default=str)
             
             self.logger.info(f"Report generated: {report_file}")
             
@@ -388,9 +466,9 @@ def main():
     config = load_config(args.config)
     
     # Override config with command line arguments
-    server = args.server or config.get("server")
-    username = args.username or config.get("username")
-    password = args.password or config.get("password")
+    server: str = args.server or config.get("server", "")
+    username: str = args.username or config.get("username", "")
+    password: str = args.password or config.get("password", "")
     port = args.port or config.get("port", 1433)
     output_dir = args.output or config.get("output_dir", "sql_extracted_objects")
     trust_cert = not args.no_trust_cert and config.get("trust_cert", True)
