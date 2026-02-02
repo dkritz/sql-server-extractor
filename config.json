@@ -1,0 +1,8 @@
+{
+  "server": "your_server_name",
+  "username": "your_username", 
+  "password": "your_password",
+  "port": 1433,
+  "output_dir": "sql_extracted_objects",
+  "trust_cert": true
+}
